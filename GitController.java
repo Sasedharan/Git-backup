@@ -6,6 +6,7 @@ import com.gitrepository.gitrepository.dto.CommitDto;
 import com.gitrepository.gitrepository.dto.ConsolidatedStatusDto;
 import com.gitrepository.gitrepository.dto.FileDto;
 import com.gitrepository.gitrepository.dto.FileStructureResponse;
+import com.gitrepository.gitrepository.dto.MergePullRequestDto;
 import com.gitrepository.gitrepository.dto.PullRequestDto;
 import com.gitrepository.gitrepository.dto.PullRequestUrlDto;
 import com.gitrepository.gitrepository.entity.PullRequestEntity;
@@ -28,7 +29,9 @@ import org.springframework.web.server.ResponseStatusException;
 import java.io.File;
 import java.io.IOException;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/git")
@@ -173,6 +176,69 @@ public class GitController {
         } catch (Exception e) {
             e.printStackTrace();
             throw new RuntimeException("Failed to retrieve pull request URLs");
+        }
+    }
+
+    @PostMapping("/merge")
+    public ResponseEntity<String> mergePullRequest(@RequestParam Long id) {
+        try {
+            String result = gitService.mergePullRequest(id);
+            return ResponseEntity.ok(result);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        } catch (GitAPIException e) {
+            return ResponseEntity.status(500).body("Error merging branches: " + e.getMessage());
+        } catch (Exception e) {
+            return ResponseEntity.status(500).body("Internal server error: " + e.getMessage());
+        }
+    }
+
+    @GetMapping("/conflictContent")
+    public ResponseEntity<Map<String, Object>> getConflictContent(
+            @RequestParam String repoName,
+            @RequestParam String sourceBranch,
+            @RequestParam String targetBranch
+    ) {
+        try {
+            Map<String, Object> response = gitService.getConflictContent(repoName, sourceBranch, targetBranch);
+            return ResponseEntity.ok(response);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Collections.singletonMap("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Collections.singletonMap("error", "Failed to retrieve conflict content."));
+        }
+    }
+
+    @PostMapping("/resolvedChanges/commits")
+    public ResponseEntity<Map<String, Object>> commitResolvedChanges( @RequestParam String repoName,
+                                                                      @RequestParam String sourceBranch,
+                                                                      @RequestParam String targetBranch) {
+        try {
+            Map<String, Object> response = gitService.commitResolvedChanges(repoName, sourceBranch, targetBranch);
+            return ResponseEntity.ok(response);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Collections.singletonMap("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Collections.singletonMap("error", "Failed to commit changes."));
+        }
+    }
+
+    @GetMapping("/fileChanges")
+    public ResponseEntity<Map<String, String>> getFileChanged(@RequestParam("repoName") String repoName,
+                                                              @RequestParam("sourceBranch") String sourceBranch,
+                                                              @RequestParam("targetBranch") String targetBranch) {
+        try {
+            List<String> differences = gitService.compareBranches(repoName, sourceBranch, targetBranch);
+
+            Map<String, String> response = new HashMap<>();
+            for (String diff : differences) {
+                response.put("file-difference-" + diff.hashCode(), diff);
+            }
+
+            return ResponseEntity.ok(response);
+        } catch (IOException | GitAPIException e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
 }

@@ -5,9 +5,11 @@ import com.gitrepository.gitrepository.entity.ModifiedFileEntity;
 import com.gitrepository.gitrepository.entity.PullRequestEntity;
 import com.gitrepository.gitrepository.repository.PullRequestRepository;
 import com.gitrepository.gitrepository.validation.ApiValidation;
+import org.eclipse.jgit.transport.PushResult;
 import org.eclipse.jgit.api.CreateBranchCommand;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.ListBranchCommand;
+import org.eclipse.jgit.api.MergeResult;
 import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.diff.DiffEntry;
@@ -16,9 +18,12 @@ import org.eclipse.jgit.errors.IncorrectObjectTypeException;
 import org.eclipse.jgit.errors.MissingObjectException;
 import org.eclipse.jgit.lib.*;
 import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
+import org.eclipse.jgit.transport.RemoteRefUpdate;
 import org.eclipse.jgit.transport.URIish;
+import org.eclipse.jgit.treewalk.AbstractTreeIterator;
 import org.eclipse.jgit.treewalk.CanonicalTreeParser;
 import org.eclipse.jgit.treewalk.TreeWalk;
 import org.json.JSONArray;
@@ -41,7 +46,9 @@ import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -367,36 +374,6 @@ public class GitService {
         return "file://" + new File(baseDirectory, repoName + ".git").getAbsolutePath();
     }
 
-//    public List<FileDto> getRepositoryFiles(String repoName, String branchName) throws IOException, GitAPIException {
-//        List<FileDto> files = new ArrayList<>();
-//        File repoDir = new File(baseDirectory, repoName);
-//
-//        try (Git git = Git.open(repoDir)) {
-//            Repository repository = git.getRepository();
-//            ObjectId branchId = repository.resolve(branchName);
-//
-//            try (RevWalk revWalk = new RevWalk(repository)) {
-//                RevCommit commit = revWalk.parseCommit(branchId);
-//                revWalk.dispose();
-//
-//                try (TreeWalk treeWalk = new TreeWalk(repository)) {
-//                    treeWalk.addTree(commit.getTree());
-//                    treeWalk.setRecursive(true);
-//                    while (treeWalk.next()) {
-//                        String filePath = treeWalk.getPathString();
-//                        ObjectId objectId = treeWalk.getObjectId(0);
-//                        ObjectLoader loader = repository.open(objectId);
-//
-//                        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-//                        loader.copyTo(outputStream);
-//                        files.add(new FileDto(filePath));
-//                    }
-//                }
-//            }
-//        }
-//        return files;
-//    }
-
     public List<FileDto> getRepositoryFiles(String repoName, String branchName) throws IOException, GitAPIException {
         List<FileDto> files = new ArrayList<>();
         File repoDir = new File(baseDirectory, repoName);
@@ -623,6 +600,11 @@ public class GitService {
         response.append("Source Branch: ").append(pullRequestDto.getSourceBranch()).append("\n");
         response.append("Target Branch: ").append(pullRequestDto.getTargetBranch()).append("\n\n");
 
+        String pullRequestLink = pullRequestDto.getPullRequestLink();
+        String pullRequestId = pullRequestLink.substring(pullRequestLink.lastIndexOf('/') + 1);
+
+        response.append("PullRequest ID: ").append(pullRequestId).append("\n\n");
+
         if (!conflictFiles.isEmpty()) {
             response.append("Conflicting files:").append("\n");
             for (String file : conflictFiles) {
@@ -699,7 +681,11 @@ public class GitService {
             pullRequestUrlDto.setAuthorName(pullRequestEntity.getAuthorName());
 
             long hoursSinceCreation = Duration.between(pullRequestEntity.getCreatedAt().toInstant(), Instant.now()).toHours();
-            pullRequestUrlDto.setCreatedHours(hoursSinceCreation);
+            long minutesSinceCreation = Duration.between(pullRequestEntity.getCreatedAt().toInstant(), Instant.now()).toMinutes();
+            long remainingMinutes = minutesSinceCreation % 60;
+
+            String formattedDuration = hoursSinceCreation + " hours " + remainingMinutes + " minutes ago";
+            pullRequestUrlDto.setCreatedHours(formattedDuration);
 
 /*            if ("Open".equalsIgnoreCase(pullRequestEntity.getStatus())) {
                 overallOpenCount++;
@@ -714,6 +700,306 @@ public class GitService {
             pullRequestUrlDtos.add(pullRequestUrlDto);
         }
         return pullRequestUrlDtos;
+    }
+
+    public String mergePullRequest(Long pullRequestId) throws GitAPIException, IOException {
+        PullRequestEntity pullRequestEntity = pullRequestRepository.findById(pullRequestId)
+                .orElseThrow(() -> new IllegalArgumentException("Invalid pull request ID"));
+
+        if ("merged".equalsIgnoreCase(pullRequestEntity.getStatus())) {
+            throw new IllegalArgumentException("PullRequest ID [ " + pullRequestEntity.getId() + " ]is already merged.");
+        }
+
+        String repoName = new File(pullRequestEntity.getRepoName()).getName();
+        File repoPath = new File(new File(baseDirectory, repoName + ".git").getAbsolutePath());
+        String targetBranch = pullRequestEntity.getTargetBranch();
+        String sourceBranch = pullRequestEntity.getSourceBranch();
+
+        File tempDir = Files.createTempDirectory("gitrepo_temp").toFile();
+        LOGGER.info("Temporary directory created: " + tempDir.getAbsolutePath());
+
+        try (Git git = Git.cloneRepository()
+                .setURI(repoPath.toURI().toString())
+                .setDirectory(tempDir)
+                .setCloneAllBranches(true)
+                .call()) {
+
+            LOGGER.info("Repository cloned to temporary directory");
+
+            git.fetch().call();
+
+            List<Ref> branchList = git.branchList()
+                    .setListMode(ListBranchCommand.ListMode.REMOTE)
+                    .call();
+
+            LOGGER.info("Available Branches");
+            for (Ref branch : branchList) {
+                LOGGER.info(branch.getName());
+            }
+            git.checkout().setName(targetBranch).call();
+
+            Ref sourceBranchRef = git.getRepository().findRef("refs/remotes/origin/" + sourceBranch);
+            if (sourceBranchRef == null) {
+                throw new IllegalArgumentException("Source branch does not exist: " + sourceBranch);
+            }
+
+            MergeResult mergeResult = git.merge()
+                    .include(sourceBranchRef)
+                    .call();
+
+            if (mergeResult.getMergeStatus().isSuccessful()) {
+                RevCommit commit = git.commit()
+                        .setMessage("Merged branch " + sourceBranch + " into " + targetBranch)
+                        .call();
+
+                git.push().call();
+
+                pullRequestEntity.setStatus("merged");
+                pullRequestEntity.setUpdatedAt(Timestamp.from(Instant.now()));
+                pullRequestRepository.save(pullRequestEntity);
+
+                StringBuilder response = new StringBuilder();
+                response.append("Merge successful:\n");
+                response.append("Branch: ").append(sourceBranch).append(" to ").append(targetBranch).append("\n");
+                response.append("Commit ID: ").append(commit.getId().name()).append("\n");
+
+                return response.toString();
+            } else {
+                return "Merge failed: " + mergeResult.getMergeStatus();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Error accessing repository", e);
+        } finally {
+            deleteTempDirectory(tempDir);
+        }
+    }
+
+    private void deleteTempDirectory(File tempDir) {
+        File[] files = tempDir.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                file.delete();
+            }
+        }
+        tempDir.delete();
+    }
+
+    public Map<String, Object> getConflictContent(String repoName, String sourceBranch, String targetBranch) {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            File repoPath = new File(baseDirectory, repoName + ".git");
+            File tempDir = Files.createTempDirectory("gitrepo_temp").toFile();
+
+            try (Git git = Git.cloneRepository()
+                    .setURI(repoPath.toURI().toString())
+                    .setDirectory(tempDir)
+                    .setCloneAllBranches(true)
+                    .call()) {
+
+                List<DiffEntry> diffs = getDiffs(git, sourceBranch, targetBranch);
+                List<Map<String, String>> conflictFiles = new ArrayList<>();
+
+                for (DiffEntry diff : diffs) {
+                    if (diff.getChangeType() == DiffEntry.ChangeType.MODIFY ||
+                            diff.getChangeType() == DiffEntry.ChangeType.DELETE) {
+                        String fileName = diff.getNewPath();
+                        String sourceContent = "";
+                        String targetContent = "";
+
+                        Map<String, String> conflictFile = new HashMap<>();
+                        conflictFile.put("fileName: ", fileName);
+                        conflictFile.put("sourceContent: ", sourceContent);
+                        conflictFile.put("targetContent: ", targetContent);
+                        conflictFiles.add(conflictFile);
+                    }
+                }
+                response.put("conflictFiles", conflictFiles);
+            } finally {
+                deleteTempDirectory(tempDir);
+            }
+        } catch (IOException | GitAPIException e) {
+            throw new IllegalArgumentException("Failed to retrieve conflict content: " + e.getMessage());
+        }
+        return response;
+    }
+
+    public Map<String, Object> commitResolvedChanges(String repoName, String sourceBranch, String targetBranch) {
+        Map<String, Object> response = new HashMap<>();
+
+        try {
+            File repoPath = new File(baseDirectory, repoName + ".git");
+            File tempDir = Files.createTempDirectory("gitrepo_temp").toFile();
+
+            try (Git git = Git.cloneRepository()
+                    .setURI(repoPath.toURI().toString())
+                    .setDirectory(tempDir)
+                    .setCloneAllBranches(true)
+                    .call()) {
+
+                git.checkout().setName(targetBranch).call();
+                Ref sourceBranchRef = git.getRepository().findRef(sourceBranch);
+
+                if (sourceBranchRef == null) {
+                    throw new IllegalArgumentException("Source branch does not exist: " + sourceBranch);
+                }
+
+                // Check for conflicts
+                List<DiffEntry> diffs = getDiffs(git, sourceBranch, targetBranch);
+                List<Map<String, String>> conflictFiles = getConflictingFilesWithContent(diffs, git);
+
+                if (!conflictFiles.isEmpty()) {
+                    response.put("conflictFiles", conflictFiles);
+                    response.put("message", "Conflicts found. Resolve conflicts and retry.");
+                } else {
+                    MergeResult mergeResult = performMerge(git, sourceBranchRef);
+
+                    if (mergeResult.getMergeStatus().isSuccessful()) {
+                        RevCommit commit = commitChanges(git, sourceBranch, targetBranch);
+
+                        pushChanges(git);
+
+                        response.put("message", "Changes from '" + sourceBranch + "' merged into '" + targetBranch + "' successfully.");
+                        response.put("commitId", commit.getId().getName());
+                    } else {
+                        throw new RuntimeException("Merge failed: " + mergeResult.getMergeStatus());
+                    }
+                }
+            } finally {
+                deleteTempDirectory(tempDir);
+            }
+        } catch (IOException | GitAPIException e) {
+            throw new RuntimeException("Failed to commit changes: " + e.getMessage());
+        }
+
+        return response;
+    }
+
+    private List<Map<String, String>> getConflictingFilesWithContent(List<DiffEntry> diffs, Git git) throws IOException {
+        List<Map<String, String>> conflictFiles = new ArrayList<>();
+        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+             DiffFormatter diffFormatter = new DiffFormatter(outputStream)) {
+            diffFormatter.setRepository(git.getRepository());
+            for (DiffEntry diff : diffs) {
+                if (diff.getChangeType() == DiffEntry.ChangeType.MODIFY ||
+                        diff.getChangeType() == DiffEntry.ChangeType.DELETE) {
+                    String fileName = diff.getNewPath();
+                    diffFormatter.format(diff);
+                    String diffOutput = outputStream.toString();
+                    outputStream.reset();
+
+                    String fileUrl = "";
+                    String sourceContent = "";
+                    String targetContent = "";
+
+                    Map<String, String> conflictFile = new HashMap<>();
+                    conflictFile.put("fileName", fileName);
+                    conflictFile.put("sourceContent", sourceContent);
+                    conflictFile.put("targetContent", targetContent);
+                    conflictFile.put("diffOutput", diffOutput); // Optionally include diff output
+                    conflictFile.put("fileUrl", fileUrl); // Optionally include file URL
+
+                    conflictFiles.add(conflictFile);
+                }
+            }
+        }
+        return conflictFiles;
+    }
+
+    public MergeResult performMerge(Git git, Ref sourceBranchRef) throws GitAPIException {
+        return git.merge()
+                .include(sourceBranchRef)
+                .setCommit(false)
+                .call();
+    }
+
+    public RevCommit commitChanges(Git git, String sourceBranch, String targetBranch) throws IOException, GitAPIException {
+
+        ObjectId headId = git.getRepository().resolve("HEAD^{tree}");
+        ObjectId sourceBranchId = git.getRepository().resolve(sourceBranch + "^{tree}");
+        ObjectId targetBranchId = git.getRepository().resolve(targetBranch + "^{tree}");
+
+        try (RevWalk revWalk = new RevWalk(git.getRepository())) {
+            RevTree sourceTree = revWalk.parseTree(sourceBranchId);
+            RevTree targetTree = revWalk.parseTree(targetBranchId);
+            RevTree headTree = revWalk.parseTree(headId);
+
+            git.checkout()
+                    .setName(targetBranch)
+                    .setAllPaths(true)
+                    .call();
+
+            // Create a new tree iterator to compare the original tree and the new tree
+            CanonicalTreeParser oldTreeIter = new CanonicalTreeParser();
+            oldTreeIter.reset(git.getRepository().newObjectReader(), headTree);
+            CanonicalTreeParser newTreeIter = new CanonicalTreeParser();
+            newTreeIter.reset(git.getRepository().newObjectReader(), targetTree);
+
+            // Compare the differences between the two trees to get the changes
+            List<DiffEntry> diffs = git.diff()
+                    .setNewTree(newTreeIter)
+                    .setOldTree(oldTreeIter)
+                    .call();
+
+            // Stage all files for commit
+            for (DiffEntry diff : diffs) {
+                git.add().addFilepattern(diff.getNewPath()).call();
+            }
+
+            // Commit the changes
+            RevCommit commit = git.commit()
+                    .setMessage("Merged changes from " + sourceBranch + " into " + targetBranch)
+                    .call();
+
+            return commit;
+        }
+    }
+
+    public void pushChanges(Git git) throws GitAPIException {
+        Iterable<PushResult> results = git.push().call();
+        for (PushResult result : results) {
+            for (RemoteRefUpdate update : result.getRemoteUpdates()) {
+                if (update.getStatus() != RemoteRefUpdate.Status.OK) {
+//                    throw new GitAPIException("Failed to push changes: " + update.getMessage());
+                }
+            }
+        }
+    }
+
+    public List<String> compareBranches(String repoName, String sourceBranch, String targetBranch) throws IOException, GitAPIException {
+
+        File repoDir = new File(baseDirectory, repoName.endsWith(".git") ? repoName : repoName + ".git");
+
+        try (Git git = Git.open(repoDir)) {
+            git.checkout().setName(targetBranch).call();
+
+            List<String> differences = new ArrayList<>();
+            AbstractTreeIterator oldTree = prepareTreeParser(git.getRepository(), sourceBranch);
+            AbstractTreeIterator newTree = prepareTreeParser(git.getRepository(), targetBranch);
+            List<DiffEntry> diff = git.diff()
+                    .setOldTree(oldTree)
+                    .setNewTree(newTree)
+                    .call();
+
+            for (DiffEntry entry : diff) {
+                differences.add(entry.getChangeType() + " " + entry.getNewPath());
+            }
+            return differences;
+        }
+    }
+
+    private AbstractTreeIterator prepareTreeParser(Repository repository, String ref) throws IOException {
+        try (RevWalk walk = new RevWalk(repository)) {
+            Ref head = repository.exactRef(ref);
+            RevCommit commit = walk.parseCommit(head.getObjectId());
+            RevTree tree = walk.parseTree(commit.getTree().getId());
+
+            CanonicalTreeParser treeParser = new CanonicalTreeParser();
+            try (ObjectReader reader = repository.newObjectReader()) {
+                treeParser.reset(reader, tree.getId());
+            }
+            walk.dispose();
+            return treeParser;
+        }
     }
 }
 
