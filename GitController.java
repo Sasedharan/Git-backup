@@ -7,6 +7,7 @@ import com.gitrepository.gitrepository.dto.ConsolidatedStatusDto;
 import com.gitrepository.gitrepository.dto.FileDto;
 import com.gitrepository.gitrepository.dto.FileStructureResponse;
 import com.gitrepository.gitrepository.dto.MergePullRequestDto;
+import com.gitrepository.gitrepository.dto.ModifiedFileDto;
 import com.gitrepository.gitrepository.dto.PullRequestDto;
 import com.gitrepository.gitrepository.dto.PullRequestUrlDto;
 import com.gitrepository.gitrepository.entity.PullRequestEntity;
@@ -157,7 +158,7 @@ public class GitController {
     @PostMapping("/pullRequest")
     public ResponseEntity<String> createPullRequest(@RequestParam String repoName,
                                                     @RequestParam String title,
-                                                    @RequestParam String description,
+                                                    @RequestParam (required = false) String description,
                                                     @RequestParam String sourceBranch,
                                                     @RequestParam String targetBranch) {
         try {
@@ -170,7 +171,7 @@ public class GitController {
     }
 
     @GetMapping("/pullRequest/urls")
-    public List<PullRequestUrlDto> getAllPullRequestUrls() {
+    public Map<String, Object> getAllPullRequestUrls() {
         try {
             return gitService.getAllPullRequestUrls();
         } catch (Exception e) {
@@ -193,52 +194,52 @@ public class GitController {
         }
     }
 
+    @GetMapping("/fileChanges")
+    public ResponseEntity<Map<String, ModifiedFileDto>> getFileChanged(@RequestParam("repoName") String repoName,
+                                                                       @RequestParam("sourceBranch") String sourceBranch,
+                                                                       @RequestParam("targetBranch") String targetBranch) {
+        try {
+            List<ModifiedFileDto> differences = gitService.fileChanges(repoName, sourceBranch, targetBranch);
+
+            Map<String, ModifiedFileDto> response = new HashMap<>();
+            for (ModifiedFileDto diff : differences) {
+                response.put("file-difference-" + diff.hashCode(), diff);
+            }
+            return ResponseEntity.ok(response);
+        } catch (IOException | GitAPIException e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
     @GetMapping("/conflictContent")
-    public ResponseEntity<Map<String, Object>> getConflictContent(
-            @RequestParam String repoName,
-            @RequestParam String sourceBranch,
-            @RequestParam String targetBranch
-    ) {
+    public ResponseEntity<Map<String, Object>> getConflictContent(@RequestParam String repoName,
+                                                                  @RequestParam String sourceBranch,
+                                                                  @RequestParam String targetBranch) {
         try {
             Map<String, Object> response = gitService.getConflictContent(repoName, sourceBranch, targetBranch);
             return ResponseEntity.ok(response);
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Collections.singletonMap("error", e.getMessage()));
         } catch (Exception e) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Collections.singletonMap("error", "Failed to retrieve conflict content."));
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Collections
+                    .singletonMap("error", "Failed to retrieve conflict content."));
         }
     }
 
-    @PostMapping("/resolvedChanges/commits")
-    public ResponseEntity<Map<String, Object>> commitResolvedChanges( @RequestParam String repoName,
-                                                                      @RequestParam String sourceBranch,
-                                                                      @RequestParam String targetBranch) {
+    @PostMapping("/resolveConflicts")
+    public ResponseEntity<?> resolveMergeConflict(
+            @RequestParam String repoName,
+            @RequestParam String sourceBranch,
+            @RequestParam String targetBranch,
+            @RequestBody List<Map<String, String>> resolvedFiles) {
+
         try {
-            Map<String, Object> response = gitService.commitResolvedChanges(repoName, sourceBranch, targetBranch);
-            return ResponseEntity.ok(response);
-        } catch (IllegalArgumentException e) {
-            return ResponseEntity.badRequest().body(Collections.singletonMap("error", e.getMessage()));
+            gitService.resolveAndCommit(repoName, sourceBranch, targetBranch, resolvedFiles);
+            return ResponseEntity.ok("Merge conflicts resolved and changes committed successfully.");
         } catch (Exception e) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Collections.singletonMap("error", "Failed to commit changes."));
-        }
-    }
-
-    @GetMapping("/fileChanges")
-    public ResponseEntity<Map<String, String>> getFileChanged(@RequestParam("repoName") String repoName,
-                                                              @RequestParam("sourceBranch") String sourceBranch,
-                                                              @RequestParam("targetBranch") String targetBranch) {
-        try {
-            List<String> differences = gitService.compareBranches(repoName, sourceBranch, targetBranch);
-
-            Map<String, String> response = new HashMap<>();
-            for (String diff : differences) {
-                response.put("file-difference-" + diff.hashCode(), diff);
-            }
-
-            return ResponseEntity.ok(response);
-        } catch (IOException | GitAPIException e) {
-            e.printStackTrace();
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body("Failed to resolve merge conflicts: " + e.getMessage());
         }
     }
 }
