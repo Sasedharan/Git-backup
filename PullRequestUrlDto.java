@@ -11,8 +11,5 @@ public class PullRequestUrlDto {
   private String pullRequestLink;
   private String authorName;
   private String status;
-  private long createdHours;
-  private int overallPRCount;
-  private int overallOpenCount;
-  private int overallClosedCount;
+  private String createdHours;
 }
